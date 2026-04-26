@@ -83,8 +83,8 @@ class _ReadingScreenState extends State<ReadingScreen>
   String _lastWords = '';
 
   // Chunked reading state
-  List<String> _textChunks = [];  // all sentences/paragraphs from last scan
-  int _chunkIndex = 0;            // current position
+  List<String> _textChunks = []; // all sentences/paragraphs from last scan
+  int _chunkIndex = 0; // current position
 
   // Debounce
   DateTime _lastCommandTime = DateTime(2000);
@@ -206,10 +206,12 @@ class _ReadingScreenState extends State<ReadingScreen>
     if (now.difference(_lastCommandTime) < _debounceDuration) return;
 
     final isNext = words.contains('next');
-    final isFlashOn =
-        words.contains(flashOnCmd) || words.contains('torch on') || words.contains('light on');
-    final isFlashOff =
-        words.contains(flashOffCmd) || words.contains('torch off') || words.contains('light off');
+    final isFlashOn = words.contains(flashOnCmd) ||
+        words.contains('torch on') ||
+        words.contains('light on');
+    final isFlashOff = words.contains(flashOffCmd) ||
+        words.contains('torch off') ||
+        words.contains('light off');
 
     final isCurrencyDetection = words.contains(currencyCmd) ||
         words.contains('currency detect') ||
@@ -220,15 +222,31 @@ class _ReadingScreenState extends State<ReadingScreen>
         words.contains('what is around me') ||
         words.contains('what is in front of me') ||
         words.contains('objects around me');
+    final isBarcodeScan = words.contains(barcodeCmd) ||
+        words.contains('scan barcode') ||
+        words.contains('scan price') ||
+        words.contains('check price') ||
+        words.contains('barcode');
+    final isEmergencyCall = words.contains(emergencyCallCmd) ||
+        (words.contains('call') &&
+            (words.contains('emergency') ||
+                words.contains('help') ||
+                words.contains('sos')));
     final isSOS = words.contains(sosCmd) ||
         words.contains('help') ||
         words.contains('sos') ||
         words.contains('save me') ||
         words.contains('emergency');
 
-    if (isSOS) {
+    if (isEmergencyCall) {
+      _lastCommandTime = now;
+      _handleEmergencyCallCommand();
+    } else if (isSOS) {
       _lastCommandTime = now;
       _handleSOSCommand();
+    } else if (isBarcodeScan) {
+      _lastCommandTime = now;
+      _handleBarcodeCommand();
     } else if (isObjectDetection) {
       _lastCommandTime = now;
       _handleObjectCommand();
@@ -300,9 +318,49 @@ class _ReadingScreenState extends State<ReadingScreen>
     await _detectCurrency();
   }
 
+  Future<void> _handleBarcodeCommand() async {
+    if (_isProcessing) return;
+    await _scanBarcodeAndPrice();
+  }
+
   Future<void> _handleObjectCommand() async {
     if (_isProcessing) return;
     await _detectObjects();
+  }
+
+  Future<void> _handleEmergencyCallCommand() async {
+    if (_isProcessing) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final number = prefs.getString(emergencyContactKey);
+
+    if (number == null || number.trim().isEmpty) {
+      _setStatus(sosConfigStatus);
+      await _speakText(sosConfigStatus);
+      return;
+    }
+
+    setState(() {
+      _isProcessing = true;
+      _setStatus(emergencyCallStatus);
+    });
+
+    try {
+      await _speakText(emergencyCallStatus);
+      final success = await _emergencyService.callEmergencyContact();
+      if (success) {
+        _setStatus('Opening emergency call.');
+      } else {
+        _setStatus('Failed to start emergency call.');
+        await _speakText('Failed to start emergency call.');
+      }
+    } catch (e) {
+      debugPrint('Emergency call error: $e');
+      _setStatus('Error during emergency call.');
+      await _speakText('An error occurred during emergency calling.');
+    } finally {
+      setState(() => _isProcessing = false);
+    }
   }
 
   Future<void> _handleNextCommand() async {
@@ -326,7 +384,8 @@ class _ReadingScreenState extends State<ReadingScreen>
 
   Future<void> _handleFlashCommand(bool on) async {
     try {
-      await _cameraController.setFlashMode(on ? FlashMode.torch : FlashMode.off);
+      await _cameraController
+          .setFlashMode(on ? FlashMode.torch : FlashMode.off);
       final feedback = on ? flashOnFeedback : flashOffFeedback;
       _setStatus(feedback);
       await _speakText(feedback);
@@ -440,6 +499,38 @@ class _ReadingScreenState extends State<ReadingScreen>
     }
   }
 
+  Future<void> _scanBarcodeAndPrice() async {
+    if (_isProcessing) return;
+    setState(() {
+      _isProcessing = true;
+      _setStatus(barcodeScanningStatus);
+    });
+
+    try {
+      await _speakText(barcodeScanningStatus);
+      await _cameraFuture;
+
+      final image = await _cameraController.takePicture();
+      final result = await _visionService.scanBarcodeAndPrice(image.path);
+      if (result == null) {
+        _setStatus(noBarcodeStatus);
+        await _speakText(noBarcodeStatus);
+      } else {
+        final spoken = result.detectedPrice == null
+            ? '$barcodeDetectedPrefix: ${result.code}. Price not found on the package.'
+            : '$barcodeDetectedPrefix: ${result.code}. $priceDetectedPrefix: ${result.detectedPrice}.';
+        _setStatus(spoken);
+        await _speakText(spoken);
+      }
+    } catch (e) {
+      debugPrint('Barcode scan error: $e');
+      _setStatus('Error during barcode scan.');
+      await _speakText('An error occurred while scanning the barcode.');
+    } finally {
+      setState(() => _isProcessing = false);
+    }
+  }
+
   /// Reads the current chunk aloud and advances the pointer.
   Future<void> _speakChunk() async {
     if (_chunkIndex >= _textChunks.length) return;
@@ -465,6 +556,7 @@ class _ReadingScreenState extends State<ReadingScreen>
     await showDialog(
       context: context,
       builder: (context) {
+        final navigator = Navigator.of(context);
         return AlertDialog(
           backgroundColor: const Color(0xFF1E1E28),
           title: const Text('Settings', style: TextStyle(color: Colors.white)),
@@ -472,7 +564,8 @@ class _ReadingScreenState extends State<ReadingScreen>
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Emergency Contact Number:', style: TextStyle(color: Colors.white70)),
+              const Text('Emergency Contact Number:',
+                  style: TextStyle(color: Colors.white70)),
               const SizedBox(height: 8),
               TextField(
                 controller: controller,
@@ -489,12 +582,21 @@ class _ReadingScreenState extends State<ReadingScreen>
                   ),
                 ),
               ),
+              const SizedBox(height: 12),
+              const Text(
+                'Voice commands: say "emergency" to prepare an SOS message or "call emergency" to start a phone call.',
+                style: TextStyle(
+                  color: Colors.white54,
+                  height: 1.4,
+                ),
+              ),
             ],
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel', style: TextStyle(color: Colors.white54)),
+              child:
+                  const Text('Cancel', style: TextStyle(color: Colors.white54)),
             ),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
@@ -502,8 +604,11 @@ class _ReadingScreenState extends State<ReadingScreen>
                 foregroundColor: Colors.white,
               ),
               onPressed: () async {
-                await prefs.setString(emergencyContactKey, controller.text.trim());
-                if (mounted) Navigator.pop(context);
+                await prefs.setString(
+                  emergencyContactKey,
+                  controller.text.trim(),
+                );
+                navigator.pop();
               },
               child: const Text('Save'),
             ),
@@ -559,7 +664,9 @@ class _ReadingScreenState extends State<ReadingScreen>
 
           // ── Subtle gradient — only top/bottom UI bars, camera stays clear ──
           Positioned(
-            top: 0, left: 0, right: 0,
+            top: 0,
+            left: 0,
+            right: 0,
             height: 130,
             child: Container(
               decoration: BoxDecoration(
@@ -575,7 +682,9 @@ class _ReadingScreenState extends State<ReadingScreen>
             ),
           ),
           Positioned(
-            bottom: 0, left: 0, right: 0,
+            bottom: 0,
+            left: 0,
+            right: 0,
             height: 300,
             child: Container(
               decoration: BoxDecoration(
@@ -610,9 +719,11 @@ class _ReadingScreenState extends State<ReadingScreen>
                   Row(
                     children: [
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 14, vertical: 10),
                         decoration: BoxDecoration(
-                          color: const Color(0xFF6C63FF).withValues(alpha: 0.20),
+                          color:
+                              const Color(0xFF6C63FF).withValues(alpha: 0.20),
                           borderRadius: BorderRadius.circular(999),
                           border: Border.all(
                             color: const Color(0xFF6C63FF),
@@ -658,7 +769,8 @@ class _ReadingScreenState extends State<ReadingScreen>
                         color: Colors.black.withValues(alpha: 0.65),
                         borderRadius: BorderRadius.circular(20),
                         border: Border.all(
-                          color: const Color(0xFF6C63FF).withValues(alpha: 0.35),
+                          color:
+                              const Color(0xFF6C63FF).withValues(alpha: 0.35),
                         ),
                       ),
                       child: Column(
@@ -701,9 +813,8 @@ class _ReadingScreenState extends State<ReadingScreen>
                       animation: _glowAnim,
                       builder: (ctx, child) {
                         return GestureDetector(
-                          onTap: _isListening
-                              ? _stopListening
-                              : _startListening,
+                          onTap:
+                              _isListening ? _stopListening : _startListening,
                           child: Container(
                             width: size.width * 0.30,
                             height: size.width * 0.30,
@@ -737,7 +848,7 @@ class _ReadingScreenState extends State<ReadingScreen>
 
                     Text(
                       _isListening
-                          ? 'Tap to pause • Say "$readCmd", "$objectCmd", "$currencyCmd", or "$stopCmd"'
+                          ? 'Tap to pause • Say "$readCmd", "$objectCmd", "$currencyCmd", "$barcodeCmd", or "$stopCmd"'
                           : 'Tap to resume listening',
                       textAlign: TextAlign.center,
                       style: const TextStyle(

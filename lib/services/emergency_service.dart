@@ -21,16 +21,21 @@ class EmergencyService {
         return _launchSMS(number, 'SOS! I need help. (Location unavailable)');
       }
     }
-    
+
     if (permission == LocationPermission.deniedForever) {
-       return _launchSMS(number, 'SOS! I need help. (Location permission denied forever)');
+      return _launchSMS(
+          number, 'SOS! I need help. (Location permission denied forever)');
     }
 
     // Get location
     try {
       final position = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high);
-      final mapsUrl = 'https://maps.google.com/?q=${position.latitude},${position.longitude}';
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+        ),
+      );
+      final mapsUrl =
+          'https://maps.google.com/?q=${position.latitude},${position.longitude}';
       final message = 'SOS! I need help. My current location is: $mapsUrl';
       return _launchSMS(number, message);
     } catch (e) {
@@ -51,6 +56,34 @@ class EmergencyService {
     try {
       if (await canLaunchUrl(smsUri)) {
         await launchUrl(smsUri);
+        return true;
+      }
+    } catch (e) {
+      // Ignored
+    }
+    return false;
+  }
+
+  Future<bool> callEmergencyContact() async {
+    final prefs = await SharedPreferences.getInstance();
+    final number = prefs.getString(emergencyContactKey);
+
+    if (number == null || number.trim().isEmpty) {
+      return false;
+    }
+
+    return _launchCall(number);
+  }
+
+  Future<bool> _launchCall(String number) async {
+    final Uri telUri = Uri(
+      scheme: 'tel',
+      path: number,
+    );
+
+    try {
+      if (await canLaunchUrl(telUri)) {
+        await launchUrl(telUri);
         return true;
       }
     } catch (e) {

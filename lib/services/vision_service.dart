@@ -1,15 +1,38 @@
 import 'dart:io';
 
+import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
 import 'package:google_mlkit_image_labeling/google_mlkit_image_labeling.dart';
+import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 
 import '../vision_assist_config.dart';
 
+class BarcodeScanResult {
+  const BarcodeScanResult({
+    required this.code,
+    this.detectedPrice,
+  });
+
+  final String code;
+  final String? detectedPrice;
+}
+
 class VisionService {
   VisionService()
-      : _imageLabeler = ImageLabeler(options: ImageLabelerOptions(confidenceThreshold: 0.45));
+      : _imageLabeler = ImageLabeler(
+            options: ImageLabelerOptions(confidenceThreshold: 0.7)),
+        _barcodeScanner = BarcodeScanner(),
+        _objectDetector = ObjectDetector(
+          options: ObjectDetectorOptions(
+            mode: DetectionMode.single,
+            classifyObjects: true,
+            multipleObjects: true,
+          ),
+        );
 
   final ImageLabeler _imageLabeler;
+  final BarcodeScanner _barcodeScanner;
+  final ObjectDetector _objectDetector;
 
   Future<List<String>> scanReadableChunks(String imagePath) async {
     final inputImage = InputImage.fromFile(File(imagePath));
@@ -38,17 +61,58 @@ class VisionService {
 
   Future<String> detectObjects(String imagePath) async {
     final inputImage = InputImage.fromFile(File(imagePath));
+    final detectedObjects = await _objectDetector.processImage(inputImage);
+    final primaryObjects = _collectDetectedObjects(detectedObjects);
+
+    if (primaryObjects.isNotEmpty) {
+      return _formatObjectSummary(primaryObjects);
+    }
+
     final labels = await _imageLabeler.processImage(inputImage);
-    return _formatObjectSummary(labels);
+    final fallbackObjects = _collectFallbackLabels(labels);
+    return _formatObjectSummary(fallbackObjects);
   }
 
-  Future<void> dispose() => _imageLabeler.close();
+  Future<BarcodeScanResult?> scanBarcodeAndPrice(String imagePath) async {
+    final inputImage = InputImage.fromFile(File(imagePath));
+    final barcodes = await _barcodeScanner.processImage(inputImage);
+
+    final barcodeValue = barcodes
+        .map((barcode) =>
+            barcode.displayValue?.trim() ?? barcode.rawValue?.trim() ?? '')
+        .firstWhere(
+          (value) => value.isNotEmpty,
+          orElse: () => '',
+        );
+
+    if (barcodeValue.isEmpty) {
+      return null;
+    }
+
+    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+    try {
+      final result = await recognizer.processImage(inputImage);
+      return BarcodeScanResult(
+        code: barcodeValue,
+        detectedPrice: _extractPriceFromText(result.text),
+      );
+    } finally {
+      await recognizer.close();
+    }
+  }
+
+  Future<void> dispose() async {
+    await _imageLabeler.close();
+    await _barcodeScanner.close();
+    await _objectDetector.close();
+  }
 
   Future<RecognizedText> _processImage({
     required InputImage inputImage,
     required TextRecognitionScript primaryScript,
   }) async {
-    Future<RecognizedText?> processWithScript(TextRecognitionScript script) async {
+    Future<RecognizedText?> processWithScript(
+        TextRecognitionScript script) async {
       TextRecognizer? recognizer;
       try {
         recognizer = TextRecognizer(script: script);
@@ -155,26 +219,114 @@ class VisionService {
     return null;
   }
 
-  String _formatObjectSummary(List<ImageLabel> labels) {
-    final labelTexts = <String>[];
+  String? _extractPriceFromText(String raw) {
+    final normalized = raw.replaceAll('\n', ' ');
 
-    for (final label in labels) {
-      var best = label.label.trim().toLowerCase();
+    final prioritizedPatterns = <RegExp>[
+      RegExp(
+        r'(?:mrp|price)\s*[:\-]?\s*(?:rs\.?|inr|₹)?\s*(\d{1,5}(?:[.,]\d{1,2})?)',
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'(?:rs\.?|inr|₹)\s*(\d{1,5}(?:[.,]\d{1,2})?)',
+        caseSensitive: false,
+      ),
+    ];
 
-      // Heuristics for common ML Kit base model misclassifications
-      if (best == 'musical instrument' || best == 'piano') {
-        best = 'laptop or keyboard';
-      } else if (best == 'fluid' || best == 'liquid') {
-        best = 'bottle';
-      } else if (best == 'drink') {
-        best = 'bottle or cup';
-      }
-
-      if (best.isNotEmpty && !labelTexts.contains(best)) {
-        labelTexts.add(best);
+    for (final pattern in prioritizedPatterns) {
+      final match = pattern.firstMatch(normalized);
+      if (match != null) {
+        final amount = match.group(1)?.replaceAll(',', '.');
+        if (amount != null && amount.isNotEmpty) {
+          return '$amount rupees';
+        }
       }
     }
 
+    return null;
+  }
+
+  List<String> _collectDetectedObjects(List<DetectedObject> objects) {
+    final scoredItems = <({String label, double score})>[];
+
+    for (final object in objects) {
+      for (final label in object.labels) {
+        final best = _normalizeObjectLabel(label.text);
+        if (best == null || label.confidence < 0.6) continue;
+        scoredItems.add((label: best, score: label.confidence));
+      }
+    }
+
+    scoredItems.sort((a, b) => b.score.compareTo(a.score));
+    return _takeUniqueTopLabels(scoredItems, limit: 4);
+  }
+
+  List<String> _collectFallbackLabels(List<ImageLabel> labels) {
+    final scoredItems = <({String label, double score})>[];
+
+    for (final label in labels) {
+      final best = _normalizeObjectLabel(label.label);
+      if (best == null || label.confidence < 0.72) continue;
+      scoredItems.add((label: best, score: label.confidence));
+    }
+
+    scoredItems.sort((a, b) => b.score.compareTo(a.score));
+    return _takeUniqueTopLabels(scoredItems, limit: 3);
+  }
+
+  List<String> _takeUniqueTopLabels(
+    List<({String label, double score})> scoredItems, {
+    required int limit,
+  }) {
+    final labelTexts = <String>[];
+
+    for (final item in scoredItems) {
+      if (!labelTexts.contains(item.label)) {
+        labelTexts.add(item.label);
+      }
+      if (labelTexts.length >= limit) {
+        break;
+      }
+    }
+
+    return labelTexts;
+  }
+
+  String? _normalizeObjectLabel(String rawLabel) {
+    var best = rawLabel.trim().toLowerCase();
+
+    if (best.isEmpty) return null;
+
+    // Heuristics for common ML Kit base model misclassifications.
+    if (best == 'musical instrument' || best == 'piano') {
+      best = 'laptop or keyboard';
+    } else if (best == 'fluid' || best == 'liquid') {
+      best = 'bottle';
+    } else if (best == 'drink') {
+      best = 'bottle or cup';
+    } else if (best == 'packaged goods') {
+      best = 'packet or box';
+    } else if (best == 'home goods') {
+      best = 'household item';
+    }
+
+    const rejectedLabels = {
+      'product',
+      'goods',
+      'material',
+      'pattern',
+      'font',
+      'rectangle',
+    };
+
+    if (rejectedLabels.contains(best)) {
+      return null;
+    }
+
+    return best;
+  }
+
+  String _formatObjectSummary(List<String> labelTexts) {
     if (labelTexts.isEmpty) {
       return noObjectsStatus;
     }
