@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -78,6 +80,7 @@ class _ReadingScreenState extends State<ReadingScreen>
   // State flags
   bool _isListening = false;
   bool _isProcessing = false;
+  bool _isSelectingReadArea = false;
   bool _sttAvailable = false;
   String _statusText = 'Initialising…';
   String _lastWords = '';
@@ -85,6 +88,7 @@ class _ReadingScreenState extends State<ReadingScreen>
   // Chunked reading state
   List<String> _textChunks = []; // all sentences/paragraphs from last scan
   int _chunkIndex = 0; // current position
+  Rect _selectionRect = const Rect.fromLTWH(0.14, 0.22, 0.72, 0.22);
 
   // Debounce
   DateTime _lastCommandTime = DateTime(2000);
@@ -121,11 +125,19 @@ class _ReadingScreenState extends State<ReadingScreen>
     if (cameras.isNotEmpty) {
       _cameraController = CameraController(
         cameras[0],
-        ResolutionPreset.high,
+        ResolutionPreset.veryHigh,
         enableAudio: false,
+        imageFormatGroup:
+            Platform.isIOS ? ImageFormatGroup.bgra8888 : ImageFormatGroup.nv21,
       );
-      _cameraFuture = _cameraController.initialize().then((_) {
-        _cameraController.setFlashMode(FlashMode.auto);
+      _cameraFuture = _cameraController.initialize().then((_) async {
+        await _cameraController.setFlashMode(FlashMode.auto);
+        try {
+          await _cameraController.setFocusMode(FocusMode.auto);
+        } catch (_) {}
+        try {
+          await _cameraController.setExposureMode(ExposureMode.auto);
+        } catch (_) {}
       });
     } else {
       _cameraFuture = Future.error('No camera found');
@@ -206,6 +218,14 @@ class _ReadingScreenState extends State<ReadingScreen>
     if (now.difference(_lastCommandTime) < _debounceDuration) return;
 
     final isNext = words.contains('next');
+    final isReadArea = words.contains(readAreaCmd) ||
+        words.contains('read selected area') ||
+        words.contains('read selection') ||
+        words.contains('scan area');
+    final isReadSelected = words.contains(readSelectedCmd) ||
+        words.contains('read this area') ||
+        words.contains('read this selection') ||
+        words.contains('scan selected area');
     final isFlashOn = words.contains(flashOnCmd) ||
         words.contains('torch on') ||
         words.contains('light on');
@@ -222,11 +242,11 @@ class _ReadingScreenState extends State<ReadingScreen>
         words.contains('what is around me') ||
         words.contains('what is in front of me') ||
         words.contains('objects around me');
-    final isBarcodeScan = words.contains(barcodeCmd) ||
-        words.contains('scan barcode') ||
+    final isPriceDetection = words.contains(priceCmd) ||
         words.contains('scan price') ||
         words.contains('check price') ||
-        words.contains('barcode');
+        words.contains('what is the price') ||
+        words.contains('tell price');
     final isEmergencyCall = words.contains(emergencyCallCmd) ||
         (words.contains('call') &&
             (words.contains('emergency') ||
@@ -244,9 +264,15 @@ class _ReadingScreenState extends State<ReadingScreen>
     } else if (isSOS) {
       _lastCommandTime = now;
       _handleSOSCommand();
-    } else if (isBarcodeScan) {
+    } else if (isReadArea) {
       _lastCommandTime = now;
-      _handleBarcodeCommand();
+      _handleReadAreaCommand();
+    } else if (isReadSelected) {
+      _lastCommandTime = now;
+      _handleReadSelectedCommand();
+    } else if (isPriceDetection) {
+      _lastCommandTime = now;
+      _handlePriceCommand();
     } else if (isObjectDetection) {
       _lastCommandTime = now;
       _handleObjectCommand();
@@ -276,6 +302,26 @@ class _ReadingScreenState extends State<ReadingScreen>
     _textChunks = []; // clear previous scan
     _chunkIndex = 0;
     await _captureAndRead();
+  }
+
+  Future<void> _handleReadAreaCommand() async {
+    if (_isProcessing) return;
+    _textChunks = [];
+    _chunkIndex = 0;
+    setState(() {
+      _isSelectingReadArea = true;
+      _setStatus(
+        'Read area mode on. Move the box, then say "$readSelectedCmd".',
+      );
+    });
+    await _speakText(
+      'Read area mode on. Move the box, then say $readSelectedCmd.',
+    );
+  }
+
+  Future<void> _handleReadSelectedCommand() async {
+    if (_isProcessing || !_isSelectingReadArea) return;
+    await _captureAndReadArea();
   }
 
   Future<void> _handleSOSCommand() async {
@@ -318,9 +364,9 @@ class _ReadingScreenState extends State<ReadingScreen>
     await _detectCurrency();
   }
 
-  Future<void> _handleBarcodeCommand() async {
+  Future<void> _handlePriceCommand() async {
     if (_isProcessing) return;
-    await _scanBarcodeAndPrice();
+    await _detectPrice();
   }
 
   Future<void> _handleObjectCommand() async {
@@ -379,7 +425,10 @@ class _ReadingScreenState extends State<ReadingScreen>
 
   Future<void> _handleStopCommand() async {
     await _tts.stop();
-    _setStatus('Stopped.');
+    setState(() {
+      _isSelectingReadArea = false;
+      _setStatus('Stopped.');
+    });
   }
 
   Future<void> _handleFlashCommand(bool on) async {
@@ -401,6 +450,7 @@ class _ReadingScreenState extends State<ReadingScreen>
     }
 
     try {
+      await _setTtsLanguageForText(text);
       await _tts.stop();
       await _tts.speak(text);
     } finally {
@@ -416,6 +466,7 @@ class _ReadingScreenState extends State<ReadingScreen>
     if (_isProcessing) return;
     setState(() {
       _isProcessing = true;
+      _isSelectingReadArea = false;
       _setStatus(scanStatus);
     });
 
@@ -444,10 +495,47 @@ class _ReadingScreenState extends State<ReadingScreen>
     }
   }
 
+  Future<void> _captureAndReadArea() async {
+    if (_isProcessing) return;
+    setState(() {
+      _isProcessing = true;
+      _setStatus('Reading selected area');
+    });
+
+    try {
+      await _speakText('Reading selected area');
+      await _cameraFuture;
+
+      final image = await _cameraController.takePicture();
+      final selectedText = await _visionService.scanReadableText(
+        image.path,
+        normalizedCrop: _selectionRectForCapturedImage(),
+      );
+
+      if (selectedText.trim().isEmpty) {
+        _setStatus(noTextStatus);
+        await _speakText(noTextStatus);
+      } else {
+        _setStatus(selectedText);
+        await _speakText(selectedText);
+      }
+    } catch (e) {
+      debugPrint('Area OCR error: $e');
+      _setStatus('Error during selected area scan.');
+      await _speakText('An error occurred while reading the selected area.');
+    } finally {
+      setState(() {
+        _isProcessing = false;
+        _isSelectingReadArea = false;
+      });
+    }
+  }
+
   Future<void> _detectObjects() async {
     if (_isProcessing) return;
     setState(() {
       _isProcessing = true;
+      _isSelectingReadArea = false;
       _setStatus(objectScanningStatus);
     });
 
@@ -473,6 +561,7 @@ class _ReadingScreenState extends State<ReadingScreen>
     if (_isProcessing) return;
     setState(() {
       _isProcessing = true;
+      _isSelectingReadArea = false;
       _setStatus(currencyScanningStatus);
     });
 
@@ -499,33 +588,29 @@ class _ReadingScreenState extends State<ReadingScreen>
     }
   }
 
-  Future<void> _scanBarcodeAndPrice() async {
+  Future<void> _detectPrice() async {
     if (_isProcessing) return;
     setState(() {
       _isProcessing = true;
-      _setStatus(barcodeScanningStatus);
+      _isSelectingReadArea = false;
+      _setStatus(priceScanningStatus);
     });
 
     try {
-      await _speakText(barcodeScanningStatus);
+      await _speakText(priceScanningStatus);
       await _cameraFuture;
 
       final image = await _cameraController.takePicture();
-      final result = await _visionService.scanBarcodeAndPrice(image.path);
-      if (result == null) {
-        _setStatus(noBarcodeStatus);
-        await _speakText(noBarcodeStatus);
-      } else {
-        final spoken = result.detectedPrice == null
-            ? '$barcodeDetectedPrefix: ${result.code}. Price not found on the package.'
-            : '$barcodeDetectedPrefix: ${result.code}. $priceDetectedPrefix: ${result.detectedPrice}.';
-        _setStatus(spoken);
-        await _speakText(spoken);
-      }
+      final detectedPrice = await _visionService.detectPriceFromImage(image.path);
+      final spoken = detectedPrice == null
+          ? noPriceStatus
+          : '$priceDetectedPrefix: $detectedPrice.';
+      _setStatus(spoken);
+      await _speakText(spoken);
     } catch (e) {
-      debugPrint('Barcode scan error: $e');
-      _setStatus('Error during barcode scan.');
-      await _speakText('An error occurred while scanning the barcode.');
+      debugPrint('Price detection error: $e');
+      _setStatus('Error during price detection.');
+      await _speakText('An error occurred while detecting price.');
     } finally {
       setState(() => _isProcessing = false);
     }
@@ -545,6 +630,112 @@ class _ReadingScreenState extends State<ReadingScreen>
   // ── Helpers ───────────────────────────────
 
   void _setStatus(String s) => _statusText = s;
+
+  Future<void> _setTtsLanguageForText(String text) async {
+    final targetLocale = _preferredTtsLocale(text);
+
+    try {
+      await _tts.setLanguage(targetLocale);
+    } catch (_) {
+      if (targetLocale != ttsLocale) {
+        await _tts.setLanguage(ttsLocale);
+      }
+    }
+  }
+
+  String _preferredTtsLocale(String text) {
+    for (final rune in text.runes) {
+      if (_isKannadaRune(rune)) return kannadaTtsLocale;
+      if (_isHindiRune(rune)) return hindiTtsLocale;
+      if (_isLatinRune(rune)) return ttsLocale;
+    }
+    return ttsLocale;
+  }
+
+  bool _isKannadaRune(int rune) => rune >= 0x0C80 && rune <= 0x0CFF;
+
+  bool _isHindiRune(int rune) => rune >= 0x0900 && rune <= 0x097F;
+
+  bool _isLatinRune(int rune) =>
+      (rune >= 0x0041 && rune <= 0x005A) ||
+      (rune >= 0x0061 && rune <= 0x007A);
+
+  Rect _selectionRectForCapturedImage() {
+    final screenSize = MediaQuery.of(context).size;
+    final previewSize = _cameraController.value.previewSize;
+
+    if (previewSize == null) return _selectionRect;
+
+    final previewContentSize = Size(
+      previewSize.height,
+      previewSize.width,
+    );
+    final scale = math.max(
+      screenSize.width / previewContentSize.width,
+      screenSize.height / previewContentSize.height,
+    );
+    final displayedWidth = previewContentSize.width * scale;
+    final displayedHeight = previewContentSize.height * scale;
+    final overflowX = (displayedWidth - screenSize.width) / 2;
+    final overflowY = (displayedHeight - screenSize.height) / 2;
+
+    final screenRect = Rect.fromLTWH(
+      _selectionRect.left * screenSize.width,
+      _selectionRect.top * screenSize.height,
+      _selectionRect.width * screenSize.width,
+      _selectionRect.height * screenSize.height,
+    );
+
+    final left =
+        ((screenRect.left + overflowX) / displayedWidth).clamp(0.0, 1.0);
+    final top =
+        ((screenRect.top + overflowY) / displayedHeight).clamp(0.0, 1.0);
+    final right =
+        ((screenRect.right + overflowX) / displayedWidth).clamp(0.0, 1.0);
+    final bottom =
+        ((screenRect.bottom + overflowY) / displayedHeight).clamp(0.0, 1.0);
+
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  void _moveSelectionBox(DragUpdateDetails details, Size size) {
+    final dx = details.delta.dx / size.width;
+    final dy = details.delta.dy / size.height;
+    final newLeft = (_selectionRect.left + dx)
+        .clamp(0.0, 1.0 - _selectionRect.width);
+    final newTop =
+        (_selectionRect.top + dy).clamp(0.0, 1.0 - _selectionRect.height);
+
+    setState(() {
+      _selectionRect = Rect.fromLTWH(
+        newLeft,
+        newTop,
+        _selectionRect.width,
+        _selectionRect.height,
+      );
+    });
+  }
+
+  void _resizeSelectionBox(DragUpdateDetails details, Size size) {
+    const minWidth = 0.22;
+    const minHeight = 0.10;
+
+    final widthDelta = details.delta.dx / size.width;
+    final heightDelta = details.delta.dy / size.height;
+    final newWidth = (_selectionRect.width + widthDelta)
+        .clamp(minWidth, 1.0 - _selectionRect.left);
+    final newHeight = (_selectionRect.height + heightDelta)
+        .clamp(minHeight, 1.0 - _selectionRect.top);
+
+    setState(() {
+      _selectionRect = Rect.fromLTWH(
+        _selectionRect.left,
+        _selectionRect.top,
+        newWidth,
+        newHeight,
+      );
+    });
+  }
 
   Future<void> _showSettingsDialog() async {
     final prefs = await SharedPreferences.getInstance();
@@ -700,6 +891,14 @@ class _ReadingScreenState extends State<ReadingScreen>
             ),
           ),
 
+          if (_isSelectingReadArea)
+            Positioned.fill(
+              child: IgnorePointer(
+                ignoring: _isProcessing,
+                child: _buildSelectionOverlay(size),
+              ),
+            ),
+
           // ── Top bar ──
           SafeArea(
             child: Padding(
@@ -731,7 +930,7 @@ class _ReadingScreenState extends State<ReadingScreen>
                           ),
                         ),
                         child: const Text(
-                          'English',
+                          'EN / HI / KN',
                           style: TextStyle(
                             fontSize: 14,
                             fontWeight: FontWeight.w600,
@@ -848,7 +1047,7 @@ class _ReadingScreenState extends State<ReadingScreen>
 
                     Text(
                       _isListening
-                          ? 'Tap to pause • Say "$readCmd", "$objectCmd", "$currencyCmd", "$barcodeCmd", or "$stopCmd"'
+                          ? 'Tap to pause • Say "$readCmd", "$readAreaCmd", "$readSelectedCmd", "$objectCmd", "$currencyCmd", "$priceCmd", or "$stopCmd"'
                           : 'Tap to resume listening',
                       textAlign: TextAlign.center,
                       style: const TextStyle(
@@ -863,6 +1062,106 @@ class _ReadingScreenState extends State<ReadingScreen>
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildSelectionOverlay(Size size) {
+    final rect = Rect.fromLTWH(
+      _selectionRect.left * size.width,
+      _selectionRect.top * size.height,
+      _selectionRect.width * size.width,
+      _selectionRect.height * size.height,
+    );
+
+    return Stack(
+      children: [
+        Positioned.fromRect(
+          rect: rect,
+          child: GestureDetector(
+            onPanUpdate: (details) => _moveSelectionBox(details, size),
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(
+                  color: const Color(0xFF03DAC6),
+                  width: 2,
+                ),
+                color: Colors.transparent,
+              ),
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Positioned(
+                    top: -14,
+                    left: 12,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF03DAC6),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: const Text(
+                        'Read Area',
+                        style: TextStyle(
+                          color: Colors.black,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    top: 10,
+                    right: 10,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.45),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: const Text(
+                        'Drag to move',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    right: -10,
+                    bottom: -10,
+                    child: GestureDetector(
+                      onPanUpdate: (details) => _resizeSelectionBox(details, size),
+                      child: Container(
+                        width: 28,
+                        height: 28,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF03DAC6),
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.black, width: 1.2),
+                        ),
+                        child: const Icon(
+                          Icons.open_in_full,
+                          size: 15,
+                          color: Colors.black,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
