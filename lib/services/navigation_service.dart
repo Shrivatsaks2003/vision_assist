@@ -10,35 +10,6 @@ class NavigationService {
   static const double _leftRegionEnd = 0.35;
   static const double _rightRegionStart = 0.65;
 
-  String analyzeEnvironment(List<DetectedObject> objects) {
-    if (objects.isEmpty) {
-      return "Clear path, walk straight.";
-    }
-
-    // Sort objects by size (closest first)
-    objects.sort((a, b) {
-      final areaA = a.boundingBox.width * a.boundingBox.height;
-      final areaB = b.boundingBox.width * b.boundingBox.height;
-      return areaB.compareTo(areaA);
-    });
-
-    // For simplicity, we analyze the most significant (closest) object
-    final primary = objects.first;
-    final area = primary.boundingBox.width * primary.boundingBox.height;
-    
-    // We need normalized coordinates to do spatial reasoning correctly.
-    // ML Kit bounding boxes are usually in pixels relative to the input image.
-    // However, for this implementation, we will assume normalized coordinates 0-1
-    // or we will need the image size.
-    // Let's design it to take the image size if possible, or assume 1.0 is full width/height
-    // if we pre-normalize.
-    
-    // For now, let's assume we pass in normalized bounding boxes or just use heuristics.
-    // Let's assume the calling code provides normalized Rects.
-    
-    return _generateGuidance(primary);
-  }
-
   String analyzeEnvironmentNormalized(List<DetectedObject> objects, Size imageSize) {
     if (objects.isEmpty) {
       return "Clear path, walk straight.";
