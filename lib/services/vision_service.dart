@@ -4,6 +4,7 @@ import 'dart:ui';
 import 'package:flutter_tesseract_ocr/flutter_tesseract_ocr.dart';
 import 'package:google_mlkit_image_labeling/google_mlkit_image_labeling.dart';
 import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image/image.dart' as img;
 
 import '../vision_assist_config.dart';
@@ -23,10 +24,12 @@ class VisionService {
             classifyObjects: true,
             multipleObjects: true,
           ),
-        );
+        ),
+        _textRecognizer = TextRecognizer(script: TextRecognitionScript.latin);
 
   final ImageLabeler _imageLabeler;
   final ObjectDetector _objectDetector;
+  final TextRecognizer _textRecognizer;
 
   Future<List<String>> scanReadableChunks(
     String imagePath, {
@@ -66,13 +69,9 @@ class VisionService {
   }
 
   Future<String?> detectCurrency(String imagePath) async {
-    final text = await _extractTextOffline(
-      imagePath,
-      args: const {
-        'psm': '6',
-      },
-    );
-    return _detectCurrencyFromText(text);
+    final inputImage = InputImage.fromFile(File(imagePath));
+    final recognizedText = await _textRecognizer.processImage(inputImage);
+    return _detectCurrencyFromText(recognizedText.text);
   }
 
   Future<String> detectObjects(String imagePath) async {
@@ -86,20 +85,21 @@ class VisionService {
     return _formatObjectSummary(mergedObjects);
   }
 
+  Future<List<DetectedObject>> detectObjectsRaw(String imagePath) async {
+    final inputImage = InputImage.fromFile(File(imagePath));
+    return await _objectDetector.processImage(inputImage);
+  }
+
   Future<String?> detectPriceFromImage(String imagePath) async {
-    final text = await _extractTextOffline(
-      imagePath,
-      args: const {
-        'psm': '11',
-        'preserve_interword_spaces': '1',
-      },
-    );
-    return _extractPriceFromText(text);
+    final inputImage = InputImage.fromFile(File(imagePath));
+    final recognizedText = await _textRecognizer.processImage(inputImage);
+    return _extractPriceFromText(recognizedText.text);
   }
 
   Future<void> dispose() async {
     await _imageLabeler.close();
     await _objectDetector.close();
+    await _textRecognizer.close();
   }
 
   Future<String> _extractTextOffline(
@@ -258,28 +258,291 @@ class VisionService {
   }
 
   String? _detectCurrencyFromText(String raw) {
-    final normalized = raw.toLowerCase().replaceAll('\n', ' ');
+    final directAmount = _extractCurrencyAmountFromText(raw);
+    if (directAmount != null) {
+      return '$directAmount rupees';
+    }
 
-    const orderedPatterns = <MapEntry<String, List<String>>>[
-      MapEntry('500 rupees', ['₹500', 'rs 500', '500 rupees', '500']),
-      MapEntry('200 rupees', ['₹200', 'rs 200', '200 rupees', '200']),
-      MapEntry('100 rupees', ['₹100', 'rs 100', '100 rupees', '100']),
-      MapEntry('50 rupees', ['₹50', 'rs 50', '50 rupees', '50']),
-      MapEntry('20 rupees', ['₹20', 'rs 20', '20 rupees', '20']),
-      MapEntry('10 rupees', ['₹10', 'rs 10', '10 rupees', '10']),
+    final normalized = raw.toLowerCase().replaceAll('\n', ' ');
+    final compact = normalized.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (compact.isEmpty) return null;
+
+    final noteKeywords = <String>[
+      'reserve bank',
+      'bank of india',
+      'bharatiya reserve bank',
+      'rupees',
+      'rupee',
+      'only',
+      'mahatma gandhi',
+      'gandhi',
+      'india',
     ];
 
-    for (final denomination in orderedPatterns) {
-      for (final pattern in denomination.value) {
-        final escaped = RegExp.escape(pattern.toLowerCase());
-        final expression = RegExp('(^|[^0-9])$escaped([^0-9]|\$)');
-        if (expression.hasMatch(normalized)) {
-          return denomination.key;
+    final denominations = <({
+      String amount,
+      String label,
+      List<RegExp> strongPatterns,
+      List<RegExp> softPatterns,
+    })>[
+      (
+        amount: '2000',
+        label: '2000 rupees',
+        strongPatterns: [
+          RegExp(r'(?:₹|rs\.?|inr)\s*2[\s,.-]*0[\s,.-]*0[\s,.-]*0'),
+          RegExp(r'\b2[\s,.-]*0[\s,.-]*0[\s,.-]*0\s*(?:rupees?|rs\.?|/-)\b'),
+          RegExp(r'\btwo\s+thousand\b'),
+          RegExp(r'\b2[o0]{3}\b'),
+        ],
+        softPatterns: [
+          RegExp(r'\b2000\b'),
+          RegExp(r'\b2[o0]{3}\b'),
+        ],
+      ),
+      (
+        amount: '500',
+        label: '500 rupees',
+        strongPatterns: [
+          RegExp(r'(?:₹|rs\.?|inr)\s*5[\s,.-]*0[\s,.-]*0'),
+          RegExp(r'\b5[\s,.-]*0[\s,.-]*0\s*(?:rupees?|rs\.?|/-)\b'),
+          RegExp(r'\bfive\s+hundred\b'),
+          RegExp(r'\b[5s][o0]{2}\b'),
+        ],
+        softPatterns: [
+          RegExp(r'\b500\b'),
+          RegExp(r'\b[5s][o0]{2}\b'),
+        ],
+      ),
+      (
+        amount: '200',
+        label: '200 rupees',
+        strongPatterns: [
+          RegExp(r'(?:₹|rs\.?|inr)\s*2[\s,.-]*0[\s,.-]*0'),
+          RegExp(r'\b2[\s,.-]*0[\s,.-]*0\s*(?:rupees?|rs\.?|/-)\b'),
+          RegExp(r'\btwo\s+hundred\b'),
+          RegExp(r'\b2[o0]{2}\b'),
+        ],
+        softPatterns: [
+          RegExp(r'\b200\b'),
+          RegExp(r'\b2[o0]{2}\b'),
+        ],
+      ),
+      (
+        amount: '100',
+        label: '100 rupees',
+        strongPatterns: [
+          RegExp(r'(?:₹|rs\.?|inr)\s*1[\s,.-]*0[\s,.-]*0'),
+          RegExp(r'\b1[\s,.-]*0[\s,.-]*0\s*(?:rupees?|rs\.?|/-)\b'),
+          RegExp(r'\bone\s+hundred\b'),
+          RegExp(r'\b1[o0]{2}\b'),
+        ],
+        softPatterns: [
+          RegExp(r'\b100\b'),
+          RegExp(r'\b1[o0]{2}\b'),
+        ],
+      ),
+      (
+        amount: '50',
+        label: '50 rupees',
+        strongPatterns: [
+          RegExp(r'(?:₹|rs\.?|inr)\s*5[\s,.-]*0\b'),
+          RegExp(r'\b5[\s,.-]*0\s*(?:rupees?|rs\.?|/-)\b'),
+          RegExp(r'\bfifty\b'),
+          RegExp(r'\b[5s][o0]\b'),
+        ],
+        softPatterns: [
+          RegExp(r'\b50\b'),
+          RegExp(r'\b[5s][o0]\b'),
+        ],
+      ),
+      (
+        amount: '20',
+        label: '20 rupees',
+        strongPatterns: [
+          RegExp(r'(?:₹|rs\.?|inr)\s*2[\s,.-]*0\b'),
+          RegExp(r'\b2[\s,.-]*0\s*(?:rupees?|rs\.?|/-)\b'),
+          RegExp(r'\btwenty\b'),
+          RegExp(r'\b2[o0]\b'),
+        ],
+        softPatterns: [
+          RegExp(r'\b20\b'),
+          RegExp(r'\b2[o0]\b'),
+        ],
+      ),
+      (
+        amount: '10',
+        label: '10 rupees',
+        strongPatterns: [
+          RegExp(r'(?:₹|rs\.?|inr)\s*1[\s,.-]*0\b'),
+          RegExp(r'\b1[\s,.-]*0\s*(?:rupees?|rs\.?|/-)\b'),
+          RegExp(r'\bten\b'),
+          RegExp(r'\b1[o0]\b'),
+        ],
+        softPatterns: [
+          RegExp(r'\b10\b'),
+          RegExp(r'\b1[o0]\b'),
+        ],
+      ),
+    ];
+
+    ({String label, int score})? bestMatch;
+
+    for (final denomination in denominations) {
+      var score = 0;
+
+      for (final pattern in denomination.strongPatterns) {
+        final matches = pattern.allMatches(compact).length;
+        if (matches > 0) {
+          score += matches * 6;
+        }
+      }
+
+      for (final pattern in denomination.softPatterns) {
+        final matches = pattern.allMatches(compact).length;
+        if (matches > 0) {
+          score += matches * 2;
+        }
+      }
+
+      if (score > 0 &&
+          noteKeywords.any((keyword) => compact.contains(keyword))) {
+        score += 3;
+      }
+
+      final standaloneAmountMatches = RegExp(
+        '(?:^|[^0-9])${RegExp.escape(denomination.amount)}(?:[^0-9]|\$)',
+      ).allMatches(compact).length;
+      score += standaloneAmountMatches;
+
+      if (bestMatch == null || score > bestMatch.score) {
+        bestMatch = (label: denomination.label, score: score);
+      }
+    }
+
+    if (bestMatch == null || bestMatch.score < 5) {
+      return null;
+    }
+
+    return bestMatch.label;
+  }
+
+  String? _extractCurrencyAmountFromText(String raw) {
+    final lines = raw
+        .split('\n')
+        .map(_normalizePriceOcrLine)
+        .where((line) => line.isNotEmpty)
+        .toList();
+
+    final candidates = <({String amount, int score})>[];
+
+    for (final line in lines) {
+      candidates.addAll(_extractCurrencyNoteCandidates(line));
+    }
+
+    if (candidates.isEmpty) {
+      final flattened = _normalizePriceOcrLine(raw.replaceAll('\n', ' '));
+      candidates.addAll(_extractCurrencyNoteCandidates(flattened));
+    }
+
+    if (candidates.isEmpty) return null;
+
+    candidates.sort((a, b) => b.score.compareTo(a.score));
+    return candidates.first.amount;
+  }
+
+  List<({String amount, int score})> _extractCurrencyNoteCandidates(
+    String line,
+  ) {
+    final candidates = <({String amount, int score})>[];
+    final lower = line.toLowerCase();
+
+    final symbolPatterns = <({RegExp pattern, int scoreBoost})>[
+      (
+        pattern: RegExp(
+          r'(?:₹|rs|inr)\s*[:=\-]?\s*([0-9oOslISBbgqD/,.\-]{1,8})',
+          caseSensitive: false,
+        ),
+        scoreBoost: 95,
+      ),
+      (
+        pattern: RegExp(
+          r'([0-9oOslISBbgqD/,.\-]{1,8})\s*(?:rupees?|rs|/-)\b',
+          caseSensitive: false,
+        ),
+        scoreBoost: 80,
+      ),
+    ];
+
+    for (final entry in symbolPatterns) {
+      for (final match in entry.pattern.allMatches(line)) {
+        final amount = _sanitizeCurrencyNoteAmount(match.group(1));
+        if (amount == null) continue;
+
+        var score = entry.scoreBoost;
+        if (line.contains('₹')) score += 25;
+        if (lower.contains('rs ') || lower.contains('inr ')) score += 20;
+        if (lower.contains('rupee') || lower.contains('rupees')) score += 15;
+        if (lower.contains('reserve bank') || lower.contains('bank of india')) {
+          score += 12;
+        }
+
+        candidates.add((amount: amount, score: score));
+      }
+    }
+
+    final wordAmounts = <String, List<String>>{
+      '2000': ['two thousand'],
+      '500': ['five hundred'],
+      '200': ['two hundred'],
+      '100': ['one hundred'],
+      '50': ['fifty'],
+      '20': ['twenty'],
+      '10': ['ten'],
+    };
+
+    for (final entry in wordAmounts.entries) {
+      for (final phrase in entry.value) {
+        if (lower.contains(phrase)) {
+          var score = 55;
+          if (lower.contains('rupee') || lower.contains('rupees')) score += 10;
+          if (lower.contains('reserve bank') || lower.contains('bank of india')) {
+            score += 10;
+          }
+          candidates.add((amount: entry.key, score: score));
         }
       }
     }
 
-    return null;
+    return candidates;
+  }
+
+  String? _sanitizeCurrencyNoteAmount(String? rawAmount) {
+    if (rawAmount == null) return null;
+
+    var amount = rawAmount.trim();
+    if (amount.isEmpty) return null;
+
+    amount = amount
+        .replaceAll(RegExp(r'[oOqQD]'), '0')
+        .replaceAll(RegExp(r'[iIlL|]'), '1')
+        .replaceAll(RegExp(r'[sS]'), '5');
+    amount = amount.replaceAll(RegExp(r'[^0-9]'), '');
+
+    if (amount.isEmpty) return null;
+    return _supportedCurrencyNoteAmount(amount);
+  }
+
+  String? _supportedCurrencyNoteAmount(String amount) {
+    const supported = {
+      '10',
+      '20',
+      '50',
+      '100',
+      '200',
+      '500',
+      '2000',
+    };
+    return supported.contains(amount) ? amount : null;
   }
 
   String? _extractPriceFromText(String raw) {

@@ -8,9 +8,12 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:intl/intl.dart';
+import 'package:string_similarity/string_similarity.dart';
 
 import 'services/emergency_service.dart';
 import 'services/vision_service.dart';
+import 'services/navigation_service.dart';
 import 'vision_assist_config.dart';
 
 // ─────────────────────────────────────────────
@@ -81,9 +84,11 @@ class _ReadingScreenState extends State<ReadingScreen>
   bool _isListening = false;
   bool _isProcessing = false;
   bool _isSelectingReadArea = false;
+  bool _isNavigationMode = false;
   bool _sttAvailable = false;
   String _statusText = 'Initialising…';
   String _lastWords = '';
+  final NavigationService _navigationService = NavigationService();
 
   // Chunked reading state
   List<String> _textChunks = []; // all sentences/paragraphs from last scan
@@ -217,83 +222,180 @@ class _ReadingScreenState extends State<ReadingScreen>
     final now = DateTime.now();
     if (now.difference(_lastCommandTime) < _debounceDuration) return;
 
-    final isNext = words.contains('next');
-    final isReadArea = words.contains(readAreaCmd) ||
-        words.contains('read selected area') ||
-        words.contains('read selection') ||
-        words.contains('scan area');
-    final isReadSelected = words.contains(readSelectedCmd) ||
-        words.contains('read this area') ||
-        words.contains('read this selection') ||
-        words.contains('scan selected area');
-    final isFlashOn = words.contains(flashOnCmd) ||
-        words.contains('torch on') ||
-        words.contains('light on');
-    final isFlashOff = words.contains(flashOffCmd) ||
-        words.contains('torch off') ||
-        words.contains('light off');
+    final intent = _getBestIntent(words);
 
-    final isCurrencyDetection = words.contains(currencyCmd) ||
-        words.contains('currency detect') ||
-        words.contains('detect note') ||
-        words.contains('detect money');
-    final isObjectDetection = words.contains(objectCmd) ||
-        words.contains('detect object') ||
-        words.contains('what is around me') ||
-        words.contains('what is in front of me') ||
-        words.contains('objects around me');
-    final isPriceDetection = words.contains(priceCmd) ||
-        words.contains('scan price') ||
-        words.contains('check price') ||
-        words.contains('what is the price') ||
-        words.contains('tell price');
-    final isEmergencyCall = words.contains(emergencyCallCmd) ||
-        (words.contains('call') &&
-            (words.contains('emergency') ||
-                words.contains('help') ||
-                words.contains('sos')));
-    final isSOS = words.contains(sosCmd) ||
-        words.contains('help') ||
-        words.contains('sos') ||
-        words.contains('save me') ||
-        words.contains('emergency');
-
-    if (isEmergencyCall) {
+    if (intent == CommandIntent.callEmergency) {
       _lastCommandTime = now;
       _handleEmergencyCallCommand();
-    } else if (isSOS) {
+    } else if (intent == CommandIntent.emergency) {
       _lastCommandTime = now;
       _handleSOSCommand();
-    } else if (isReadArea) {
+    } else if (intent == CommandIntent.time) {
+      _lastCommandTime = now;
+      _handleTimeCommand();
+    } else if (intent == CommandIntent.date) {
+      _lastCommandTime = now;
+      _handleDateCommand();
+    } else if (intent == CommandIntent.day) {
+      _lastCommandTime = now;
+      _handleDayCommand();
+    } else if (intent == CommandIntent.navOn) {
+      _lastCommandTime = now;
+      _handleNavigationToggle(true);
+    } else if (intent == CommandIntent.navOff) {
+      _lastCommandTime = now;
+      _handleNavigationToggle(false);
+    } else if (intent == CommandIntent.readArea) {
       _lastCommandTime = now;
       _handleReadAreaCommand();
-    } else if (isReadSelected) {
+    } else if (intent == CommandIntent.readSelected) {
       _lastCommandTime = now;
       _handleReadSelectedCommand();
-    } else if (isPriceDetection) {
+    } else if (intent == CommandIntent.detectPrice) {
       _lastCommandTime = now;
       _handlePriceCommand();
-    } else if (isObjectDetection) {
+    } else if (intent == CommandIntent.detectObjects) {
       _lastCommandTime = now;
       _handleObjectCommand();
-    } else if (isCurrencyDetection) {
+    } else if (intent == CommandIntent.detectCurrency) {
       _lastCommandTime = now;
       _handleCurrencyCommand();
-    } else if (words.contains(readCmd)) {
+    } else if (intent == CommandIntent.read) {
       _lastCommandTime = now;
       _handleReadCommand();
-    } else if (isNext) {
+    } else if (intent == CommandIntent.next) {
       _lastCommandTime = now;
       _handleNextCommand();
-    } else if (isFlashOn) {
+    } else if (intent == CommandIntent.flashOn) {
       _lastCommandTime = now;
       _handleFlashCommand(true);
-    } else if (isFlashOff) {
+    } else if (intent == CommandIntent.flashOff) {
       _lastCommandTime = now;
       _handleFlashCommand(false);
-    } else if (words.contains(stopCmd)) {
+    } else if (intent == CommandIntent.stop) {
       _lastCommandTime = now;
       _handleStopCommand();
+    }
+  }
+
+  CommandIntent _getBestIntent(String input) {
+    if (input.isEmpty) return CommandIntent.none;
+
+    CommandIntent bestIntent = CommandIntent.none;
+    double bestScore = 0;
+
+    for (final entry in commandRegistry.entries) {
+      for (final variation in entry.value) {
+        // Check for exact containment first (high priority)
+        if (input.contains(variation)) {
+          return entry.key;
+        }
+        
+        // Use string_similarity for fuzzy matching
+        final score = input.similarityTo(variation);
+        if (score > bestScore) {
+          bestScore = score;
+          bestIntent = entry.key;
+        }
+      }
+    }
+
+    // Threshold for fuzzy matching (65% similarity)
+    if (bestScore > 0.65) {
+      return bestIntent;
+    }
+
+    return CommandIntent.none;
+  }
+
+  Future<void> _handleTimeCommand() async {
+    final now = DateTime.now();
+    final timeString = DateFormat('h:mm a').format(now);
+    final spoken = 'The current time is $timeString.';
+    _setStatus(spoken);
+    await _speakText(spoken);
+  }
+
+  Future<void> _handleDateCommand() async {
+    final now = DateTime.now();
+    final dateString = DateFormat('MMMM d, y').format(now);
+    final spoken = 'Today\'s date is $dateString.';
+    _setStatus(spoken);
+    await _speakText(spoken);
+  }
+
+  Future<void> _handleDayCommand() async {
+    final now = DateTime.now();
+    final dayString = DateFormat('EEEE').format(now);
+    final spoken = 'Today is $dayString.';
+    _setStatus(spoken);
+    await _speakText(spoken);
+  }
+
+  Future<void> _handleNavigationToggle(bool on) async {
+    if (_isNavigationMode == on) return;
+
+    setState(() {
+      _isNavigationMode = on;
+      _setStatus(on ? navStartedStatus : navStoppedStatus);
+    });
+
+    await _speakText(on ? navStartedStatus : navStoppedStatus);
+
+    if (on) {
+      unawaited(_runNavigationLoop());
+    }
+  }
+
+  Future<void> _runNavigationLoop() async {
+    String lastGuidance = "";
+    DateTime lastHeartbeat = DateTime.now();
+
+    while (_isNavigationMode && mounted) {
+      if (_isProcessing) {
+        await Future.delayed(const Duration(milliseconds: 800));
+        continue;
+      }
+
+      try {
+        await _cameraFuture;
+        final image = await _cameraController.takePicture();
+
+        if (!_isNavigationMode || !mounted) {
+          final file = File(image.path);
+          if (await file.exists()) await file.delete();
+          return;
+        }
+
+        final objects = await _visionService.detectObjectsRaw(image.path);
+        final previewSize = _cameraController.value.previewSize;
+
+        if (previewSize != null) {
+          final size = Size(previewSize.height, previewSize.width);
+          final guidance =
+              _navigationService.analyzeEnvironmentNormalized(objects, size);
+
+          final isClearPath = guidance.contains("Clear path");
+          final now = DateTime.now();
+          final shouldSpeak = guidance != lastGuidance ||
+              (isClearPath &&
+                  now.difference(lastHeartbeat) > const Duration(seconds: 10));
+
+          if (_isNavigationMode && mounted && shouldSpeak) {
+            _setStatus(guidance);
+            await _speakText(guidance);
+            lastGuidance = guidance;
+            if (isClearPath) lastHeartbeat = now;
+          }
+        }
+
+        final file = File(image.path);
+        if (await file.exists()) await file.delete();
+      } catch (e) {
+        debugPrint('Navigation loop error: $e');
+      }
+
+      await Future.delayed(const Duration(milliseconds: 2000));
     }
   }
 
@@ -427,6 +529,7 @@ class _ReadingScreenState extends State<ReadingScreen>
     await _tts.stop();
     setState(() {
       _isSelectingReadArea = false;
+      _isNavigationMode = false;
       _setStatus('Stopped.');
     });
   }
@@ -1047,7 +1150,7 @@ class _ReadingScreenState extends State<ReadingScreen>
 
                     Text(
                       _isListening
-                          ? 'Tap to pause • Say "$readCmd", "$readAreaCmd", "$readSelectedCmd", "$objectCmd", "$currencyCmd", "$priceCmd", or "$stopCmd"'
+                          ? 'Tap to pause • Say "navigation mode on", "$timeCmd", "$dateCmd", "$dayCmd", "$readCmd", or "$objectCmd"'
                           : 'Tap to resume listening',
                       textAlign: TextAlign.center,
                       style: const TextStyle(
